@@ -25,7 +25,7 @@ Path: ~/Downloads/docs
 Files: .pdf .docx .doc .pptx .xlsx
 
 ## resumes
-Path: ~/Desktop/resumes
+Path: ~/Library/Mobile Documents/com~apple~CloudDocs/Personal/Resumes
 Names: resume cv curriculum
 
 ## archives
