@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -25,6 +26,7 @@ INDEX_USER = APP / "library.md"
 MODEL = os.environ.get("LIBRARIAN_MODEL", "qwen3.5:0.8b")
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 SKIP_EXT = {".crdownload", ".download", ".part", ".tmp", ".ds_store"}
+SAFE_NAME = re.compile(r"^[a-z0-9][a-z0-9._-]{0,78}[a-z0-9]$")
 
 
 @dataclass
@@ -218,7 +220,9 @@ def classify(filename: str, slugs: list[str]) -> str:
     return "other"
 
 
-def unique_dest(dest: Path) -> Path:
+def unique_dest(dest: Path, src: Path | None = None) -> Path:
+    if src is not None and dest.exists() and dest.resolve() == src.resolve():
+        return dest
     if not dest.exists():
         return dest
     n = 1
@@ -226,7 +230,138 @@ def unique_dest(dest: Path) -> Path:
         cand = dest.with_name(f"{dest.stem}-{n}{dest.suffix}")
         if not cand.exists():
             return cand
+        if src is not None and cand.resolve() == src.resolve():
+            return cand
         n += 1
+
+
+JUNK_BITS = (
+    "riverside_",
+    "riverside ",
+    "copy_of_",
+    "copy of ",
+    "copy_of ",
+    "gokul_bala's studio",
+    "gokul bala's studio",
+    "gokul_bala",
+    "backup-video",
+    "copy-of-",
+    "copy-of ",
+)
+COPY_MARK = re.compile(r"\s*\(\d+\)\s*")
+HEXISH = re.compile(r"^[0-9a-f]{8,}$", re.I)
+DIGITS = re.compile(r"^\d{8,}$")
+
+
+def slugify(stem: str) -> str:
+    s = stem.lower()
+    for bit in JUNK_BITS:
+        s = s.replace(bit, " ")
+    s = COPY_MARK.sub(" ", s)
+    s = s.replace("—", " ").replace("–", " ").replace("_", " ").replace("'", "")
+    s = re.sub(r"[^a-z0-9]+", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    return s[:70]
+
+
+def is_messy(name: str) -> bool:
+    stem = Path(name).stem
+    low = name.lower()
+    if any(b.strip() in low for b in ("riverside", "copy of", "copy_of", "studio")):
+        return True
+    if COPY_MARK.search(name):
+        return True
+    if HEXISH.match(stem) or DIGITS.match(stem):
+        return True
+    if " " in name or name != name.strip():
+        return True
+    if len(stem) > 60:
+        return True
+    return False
+
+
+def resume_name(name: str) -> str | None:
+    ext = Path(name).suffix.lower() or ".pdf"
+    s = slugify(Path(name).stem)
+    for drop in ("gokul", "bala", "resume", "cv"):
+        s = re.sub(rf"(^|-){drop}(-|$)", "-", s)
+    s = re.sub(r"-{2,}", "-", s).strip("-")
+    if s:
+        return f"gokul-bala-resume-{s}{ext}"
+    return f"gokul-bala-resume{ext}"
+
+
+def rule_rename(name: str, shelf: str) -> str | None:
+    ext = Path(name).suffix.lower()
+    if not ext:
+        return None
+    if shelf == "resumes":
+        return resume_name(name)
+    stem = slugify(Path(name).stem)
+    if not stem:
+        return None
+    if shelf == "video" and stem.startswith("whatsapp-video"):
+        stem = stem.replace("whatsapp-video", "whatsapp")
+    if stem.isdigit():
+        stem = f"{shelf}-{stem}"
+    proposed = f"{stem}{ext}"
+    if proposed.lower() == name.lower() and not is_messy(name):
+        return None
+    if not SAFE_NAME.match(stem):
+        return None
+    return proposed
+
+
+def model_rename(name: str, shelf: str) -> str | None:
+    ext = Path(name).suffix.lower()
+    prompt = (
+        f"Shelf: {shelf}\n"
+        f"Current filename: {name}\n"
+        "Give a short lowercase filename. Keep the same extension. "
+        "Use hyphens not spaces. No folders. JSON only: {\"name\":\"example.pdf\"}"
+    )
+    data = ollama_post(
+        "/api/chat",
+        {
+            "model": MODEL,
+            "stream": False,
+            "keep_alive": "2m",
+            "options": {"num_ctx": 256, "temperature": 0},
+            "messages": [{"role": "user", "content": prompt}],
+        },
+    )
+    raw = ((data.get("message") or {}).get("content") or "").strip()
+    start, end = raw.find("{"), raw.rfind("}")
+    blob = raw[start : end + 1] if start >= 0 and end > start else ""
+    try:
+        proposed = str(json.loads(blob).get("name") or "").strip()
+    except json.JSONDecodeError:
+        return None
+    p = Path(proposed)
+    if p.suffix.lower() != ext:
+        proposed = p.stem + ext
+        p = Path(proposed)
+    stem = slugify(p.stem)
+    if not stem or not SAFE_NAME.match(stem):
+        return None
+    return f"{stem}{ext}"
+
+
+def attach_new_name(row: dict, use_model: bool) -> None:
+    name = row["name"]
+    shelf = row["shelf"]
+    dest = Path(row["dest"])
+    new = rule_rename(name, shelf)
+    if not new and use_model and is_messy(name):
+        new = model_rename(name, shelf)
+        if new:
+            row["rename_via"] = "model"
+    elif new:
+        row["rename_via"] = "rule"
+    if not new or new.lower() == name.lower():
+        return
+    row["new_name"] = new
+    row["dest"] = str(unique_dest(dest.with_name(new)))
 
 
 def plan(lib: Library, use_model: bool) -> list[dict]:
@@ -255,26 +390,73 @@ def plan(lib: Library, use_model: bool) -> list[dict]:
             else:
                 leftovers.append(row)
 
+    model_on = False
     if leftovers and use_model:
         ensure_ollama()
+        model_on = True
         slugs = lib.slugs()
-        try:
-            for i, row in enumerate(leftovers, 1):
-                slug = classify(row["name"], slugs)
-                shelf = lib.by_slug(slug) or lib.by_slug("other")
-                dest = unique_dest(shelf.path / Path(row["name"]).name)
-                row.update(shelf=shelf.slug, dest=str(dest), via="model")
-                rows.append(row)
-                print(f"[{i}/{len(leftovers)}] {shelf.slug:12} {row['name']}", file=sys.stderr)
-        finally:
-            stop_model()
+        for i, row in enumerate(leftovers, 1):
+            slug = classify(row["name"], slugs)
+            shelf = lib.by_slug(slug) or lib.by_slug("other")
+            dest = unique_dest(shelf.path / Path(row["name"]).name)
+            row.update(shelf=shelf.slug, dest=str(dest), via="model")
+            rows.append(row)
+            print(f"[{i}/{len(leftovers)}] {shelf.slug:12} {row['name']}", file=sys.stderr)
     else:
         other = lib.by_slug("other")
         for row in leftovers:
             dest = unique_dest(other.path / Path(row["name"]).name)
             row.update(shelf="other", dest=str(dest), via="other")
             rows.append(row)
+    return rows, model_on
+
+
+def existing_shelf_rows(lib: Library) -> list[dict]:
+    rows = []
+    for shelf in lib.shelves:
+        if not shelf.path.is_dir():
+            continue
+        for path in iter_files(shelf.path):
+            if shelf.slug != "resumes" and not is_messy(path.name):
+                continue
+            rows.append(
+                {
+                    "path": str(path),
+                    "name": path.name,
+                    "inbox": str(shelf.path),
+                    "shelf": shelf.slug,
+                    "dest": str(path),
+                    "via": "rename-existing",
+                }
+            )
     return rows
+
+
+def attach_renames(rows: list[dict], use_model: bool, model_already_on: bool) -> bool:
+    started = model_already_on
+    try:
+        for row in rows:
+            if not row.get("shelf"):
+                continue
+            new = rule_rename(row["name"], row["shelf"])
+            if not new and use_model and is_messy(row["name"]):
+                if not started:
+                    ensure_ollama()
+                    started = True
+                new = model_rename(row["name"], row["shelf"])
+                if new:
+                    row["rename_via"] = "model"
+            elif new:
+                row["rename_via"] = "rule"
+            if not new or new.lower() == row["name"].lower():
+                continue
+            dest_dir = Path(row["dest"]).parent
+            row["new_name"] = new
+            row["dest"] = str(unique_dest(dest_dir / new, src=Path(row["path"])))
+    finally:
+        if started:
+            stop_model()
+    return started
 
 
 def apply(rows: list[dict]) -> int:
@@ -285,7 +467,13 @@ def apply(rows: list[dict]) -> int:
         if src.resolve() == dest.resolve() or not src.exists():
             continue
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest = unique_dest(dest)
+        dest = unique_dest(dest, src=src)
+        if src.resolve() == dest.resolve() and src.name == dest.name:
+            continue
+        if src.name.lower() == dest.name.lower() and src.parent == dest.parent:
+            tmp = unique_dest(src.with_name(src.stem + "-case" + src.suffix))
+            src.rename(tmp)
+            src = tmp
         shutil.move(str(src), str(dest))
         log.append({"from": str(src), "to": str(dest), "shelf": row["shelf"]})
         n += 1
@@ -337,17 +525,21 @@ def main():
         return
 
     lib = load_library(index)
-    rows = plan(lib, use_model=not args.no_model)
+    rows, model_on = plan(lib, use_model=not args.no_model)
+    rows.extend(existing_shelf_rows(lib))
+    attach_renames(rows, use_model=not args.no_model, model_already_on=model_on)
     counts: dict[str, int] = {}
     for r in rows:
         counts[r["shelf"]] = counts.get(r["shelf"], 0) + 1
     moved = apply(rows) if args.apply else 0
+    renamed = sum(1 for r in rows if r.get("new_name"))
     print(
         json.dumps(
             {
                 "index": str(index),
                 "apply": bool(args.apply),
                 "moved": moved,
+                "renamed": renamed,
                 "count": len(rows),
                 "by_shelf": counts,
                 "items": rows,
