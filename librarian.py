@@ -20,6 +20,7 @@ from pathlib import Path
 
 HOME = Path.home()
 APP = HOME / "Library/Application Support/Librarian"
+INDEX_ICLOUD = HOME / "Library/Mobile Documents/com~apple~CloudDocs/index.md"
 INDEX_USER = APP / "library.md"
 MODEL = os.environ.get("LIBRARIAN_MODEL", "qwen3.5:0.8b")
 OLLAMA = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
@@ -105,10 +106,21 @@ def load_library(path: Path) -> Library:
 
 def ensure_user_index() -> Path:
     APP.mkdir(parents=True, exist_ok=True)
-    bundled = Path(__file__).resolve().parent / "library.md"
-    if not INDEX_USER.exists():
+    bundled = Path(__file__).resolve().parent / "index.md"
+    if not bundled.exists():
+        bundled = Path(__file__).resolve().parent / "library.md"
+    if INDEX_ICLOUD.exists():
+        return INDEX_ICLOUD
+    if not INDEX_USER.exists() and bundled.exists():
         INDEX_USER.write_text(bundled.read_text())
-    return INDEX_USER
+        if not INDEX_ICLOUD.exists():
+            try:
+                INDEX_ICLOUD.parent.mkdir(parents=True, exist_ok=True)
+                INDEX_ICLOUD.write_text(bundled.read_text())
+                return INDEX_ICLOUD
+            except OSError:
+                pass
+    return INDEX_USER if INDEX_USER.exists() else bundled
 
 
 def iter_files(folder: Path):
@@ -118,6 +130,8 @@ def iter_files(folder: Path):
         if p.name.startswith(".") or p.is_dir():
             continue
         if p.suffix.lower() in SKIP_EXT:
+            continue
+        if p.name.lower() in {"index.md", "library.md"}:
             continue
         yield p
 
